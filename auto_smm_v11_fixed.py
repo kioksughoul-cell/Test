@@ -1992,18 +1992,30 @@ def _dialog_timeout_watcher_loop(c: "Cardinal"):
                     continue
 
                 # 2) Напоминание ровно один раз.
+                # === v11.4 FIX (2026-05): добавили await_confirm ===
+                # Раньше watcher напоминал только в step="await_link". Если
+                # покупатель прислал ссылку и забил на «+/-», запись висела
+                # 24 часа без напоминания, потом авто-рефанд. Теперь
+                # напоминаем и тех, кто застрял на подтверждении ссылки.
                 if (
                     age >= DIALOG_REMINDER_AFTER_SEC
                     and not data.get("reminded_at")
-                    and step == "await_link"
+                    and step in ("await_link", "await_confirm")
                 ):
-                    try:
-                        c.send_message(
-                            buyer_chat_id,
+                    if step == "await_confirm":
+                        reminder_text = (
+                            "⏳ Напоминание: подтвердите ссылку, отправив + (запустить заказ) "
+                            "или - (ввести другую ссылку). Если не ответите, заказ будет "
+                            "автоматически отменён с возвратом средств."
+                        )
+                    else:
+                        reminder_text = (
                             "⏳ Напоминание: пришлите, пожалуйста, ссылку для запуска "
                             "вашего заказа. Если ссылка не поступит, заказ будет "
-                            "автоматически отменён с возвратом средств.",
+                            "автоматически отменён с возвратом средств."
                         )
+                    try:
+                        c.send_message(buyer_chat_id, reminder_text)
                         with _FILES_LOCK:
                             if str(order_id) in waiting_for_link:
                                 waiting_for_link[str(order_id)]["reminded_at"] = now
@@ -2384,10 +2396,74 @@ def _auto_smm_handler_inner(c: Cardinal, e, *args):
 
         service_id, real_amount, srv_number = found_lot
 
-        od_full = c.account.get_order(orderID)
-        buyer_chat_id = od_full.chat_id
-        buyer_id = od_full.buyer_id
-        buyer_username = _safe_username(od_full.buyer_username)  # P.20
+        # === v11.4 FIX (2026-05): retry для get_order() ===
+        # Раньше один сетевой сбой к FunPay API на свежесозданном заказе
+        # (FunPay часто отдаёт 403/404 в первые секунды после оплаты, пока
+        # заказ ещё не «прокатился» по их кэшам) → исключение всплывало в
+        # auto_smm_handler catch-all, покупатель видел «Внутренняя ошибка»,
+        # а запись в waiting_for_link не успевала создаться. Заказ «терялся»
+        # навсегда (его не подхватывал ни один watcher).
+        #
+        # Теперь: 3 попытки с короткой задержкой, при полном провале —
+        # fallback на данные из NewOrderEvent (e.order и e.message содержат
+        # минимум: buyer_id, chat_id, buyer_username), чтобы хотя бы создать
+        # запись в waiting_for_link и принять ссылку.
+        od_full = None
+        last_get_order_err: Optional[BaseException] = None
+        for _attempt in range(1, 4):
+            try:
+                od_full = c.account.get_order(orderID)
+                break
+            except Exception as _ge:
+                last_get_order_err = _ge
+                logger.warning(
+                    f"get_order({orderID}) attempt {_attempt}/3 failed: {_ge}",
+                    extra={
+                        "event": "get_order_retry",
+                        "order_id": str(orderID),
+                        "attempt": _attempt,
+                        "error": str(_ge)[:200],
+                    },
+                )
+                if _attempt < 3:
+                    # Короткий backoff: 2с, 5с. Уважаем shutdown.
+                    if _SHUTDOWN_EVENT.wait(2 if _attempt == 1 else 5):
+                        return
+
+        if od_full is not None:
+            buyer_chat_id = od_full.chat_id
+            buyer_id = od_full.buyer_id
+            buyer_username = _safe_username(od_full.buyer_username)
+        else:
+            # Fallback: используем данные из NewOrderEvent. У FunPayAPI поле
+            # order_.buyer_id есть, chat_id и username — могут отсутствовать.
+            logger.error(
+                f"get_order({orderID}) исчерпал 3 попытки. "
+                f"Fallback на данные из NewOrderEvent. last_err={last_get_order_err!r}",
+                extra={
+                    "event": "get_order_exhausted",
+                    "order_id": str(orderID),
+                    "error": str(last_get_order_err)[:200],
+                },
+            )
+            buyer_id = getattr(order_, "buyer_id", None)
+            buyer_chat_id = getattr(order_, "chat_id", None) or buyer_id
+            buyer_username = _safe_username(getattr(order_, "buyer_username", None))
+            if not buyer_chat_id:
+                # без chat_id мы вообще не можем общаться с покупателем —
+                # пишем в админ-чат и выходим, заказ останется висеть на FP.
+                logger.error(
+                    f"NewOrderEvent для #{orderID}: buyer_chat_id неизвестен, "
+                    f"невозможно начать диалог. Заказ требует ручной обработки."
+                )
+                _admin_notify(
+                    f"⚠ <b>Не удалось получить данные заказа</b> <code>{orderID}</code>\n"
+                    f"FunPay API недоступен 3 попытки подряд, и в NewOrderEvent "
+                    f"не было buyer_chat_id. Обработай заказ вручную: "
+                    f"<a href='https://funpay.com/orders/{orderID}/'>открыть</a>\n"
+                    f"Последняя ошибка: <code>{html.escape(str(last_get_order_err)[:200])}</code>"
+                )
+                return
 
         # P.29: вычисляем профиль покупателя ДО инкремента счётчика
         # (его обновим уже после успешного оформления через update_customer_profile).
@@ -3940,20 +4016,23 @@ def init_commands(c_: Cardinal):
         except Exception:
             pass
 
-    # v11.2: глобальный fallback. Если в будущем добавим callback_data без хендлера —
-    # покупатель/админ получат тихий no-op + мы увидим запись в логе, какой именно
-    # callback осиротел.
-    @bot.callback_query_handler(func=lambda call: True)
-    def unknown_callback(call: types.CallbackQuery):
-        logger.warning(
-            f"unknown callback_data: {call.data!r}",
-            extra={"event": "unknown_callback", "callback_data": call.data,
-                   "user_id": getattr(call.from_user, "id", None)},
-        )
-        try:
-            bot.answer_callback_query(call.id)
-        except Exception:
-            pass
+    # === v11.4 FIX (2026-05): catch-all БОЛЬШЕ НЕТ. ===
+    # Раньше здесь висел @bot.callback_query_handler(func=lambda call: True),
+    # который перехватывал ВСЕ callback'и в TG-боте FPC, включая колбэки
+    # других плагинов (TeamX-воронка, авто-выдача FPC, авто-ответчик FPC) и
+    # самого Cardinal. Из-за этого пользователь нажимал «Подать заявку» в
+    # сторонней воронке → catch-all отвечал answer_callback_query(call.id) и
+    # реальный handler никогда не отрабатывал. Воронка фиксировала «Застрял
+    # на кнопке».
+    #
+    # Если в будущем понадобится логировать «осиротевшие» callback'и нашего
+    # плагина — фильтруй ИМЕННО по prefix-ам нашего плагина, не по `True`.
+    # Пример:
+    #   _MY_PREFIXES = ("lot_settings", "edit_apiurl_", "check_balance_", ...)
+    #   @bot.callback_query_handler(
+    #       func=lambda call: any(call.data.startswith(p) for p in _MY_PREFIXES)
+    #   )
+    #   def my_orphan_callback(call): ...
 
     c_.telegram.msg_handler(start_smm, commands=["start_smm"])
     c_.telegram.msg_handler(stop_smm, commands=["stop_smm"])
