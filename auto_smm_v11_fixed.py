@@ -9,6 +9,7 @@ import re
 import os
 import json
 import logging
+from logging.handlers import RotatingFileHandler  # review-fix: ротация auto_smm.log
 import random
 import threading
 import requests
@@ -16,15 +17,13 @@ import shutil
 import time
 import io
 import html
-import hmac
-import sys
+import hmac  # используется в webhook secret-проверке
 import sqlite3
-import subprocess
 
 from datetime import datetime, timedelta
 
 from FunPayAPI.updater.events import NewMessageEvent, NewOrderEvent
-from FunPayAPI import enums
+# review-fix: убраны неиспользуемые импорты sys, subprocess, FunPayAPI.enums
 
 import uuid
 import hashlib
@@ -33,25 +32,20 @@ from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 
 NAME = "AutoSMM"
-VERSION = "4.2"
+VERSION = "4.3"
 DESCRIPTION = "Плагин для автоматической накрутки через 2+ сервис"
 CREDITS = ""
 UUID = "c800e7e9-05ce-43eb-addc-4f5841f79726"
-SETTINGS_PAGE = False
+SETTINGS_PAGE = True  # review-fix: даёт кнопку «Настройки» в карточке плагина FPC
 
 
 LOGGER_PREFIX = "[AUTO autosmm]"
-logger = logging.getLogger("FPC.autosmm")
 
 waiting_for_lots_upload = set()
 
-UPDATE = """
-Примечания к обновлению:
-
-- Можно включить/выключить подтверждение ссылки
-- Теперь правильно считается чистая прибыль
-- Исправлены некоторые мелкие баги
-"""
+# review-fix: префикс callback_data плагина, чтобы не конфликтовать с другими
+# плагинами и встроенным ПУ FPC. Все callback'и плагина начинаются с "asmm:".
+CB_PREFIX = "asmm:"
 
 
 VALID_LINKS_PATH = os.path.join("storage", "cache", "valid_link.json")
@@ -107,6 +101,9 @@ LOG_PATH = os.path.join(LOG_DIR, "auto_smm.log")
 
 logger = logging.getLogger("FPC.autosmm")
 logger.setLevel(logging.INFO)
+# review-fix: не дублировать наши JSON-записи в общий FPC-лог.
+# JSON остаётся только в auto_smm.log; в FPC-лог уходит человеческий стрим.
+logger.propagate = False
 
 
 class _JsonLogFormatter(logging.Formatter):
@@ -145,11 +142,21 @@ class _JsonLogFormatter(logging.Formatter):
         return json.dumps(payload, ensure_ascii=False)
 
 
-# JSON-handler пишет в auto_smm.log (для парсинга/grep по полям).
-file_handler = logging.FileHandler(LOG_PATH, encoding='utf-8')
-file_handler.setLevel(logging.INFO)
-file_handler.setFormatter(_JsonLogFormatter())
-logger.addHandler(file_handler)
+# review-fix: ротация auto_smm.log — 20 МБ × 10 файлов. Раньше файл рос
+# бесконечно, на активной точке за полгода — десятки гигабайт.
+# Если хендлер уже добавлен (повторный импорт модуля), не дублируем его —
+# иначе каждая запись в логе будет писаться 2-3 раза.
+if not any(isinstance(h, RotatingFileHandler) and getattr(h, "baseFilename", "") == os.path.abspath(LOG_PATH)
+           for h in logger.handlers):
+    file_handler = RotatingFileHandler(
+        LOG_PATH,
+        maxBytes=20 * 1024 * 1024,
+        backupCount=10,
+        encoding='utf-8',
+    )
+    file_handler.setLevel(logging.INFO)
+    file_handler.setFormatter(_JsonLogFormatter())
+    logger.addHandler(file_handler)
 
 # Человеческий handler пишет в кардинал-лог (FPC.autosmm пробрасывается выше).
 # Если хочется зеркала JSON в stdout — раскомментировать ниже.
@@ -1277,9 +1284,44 @@ def create_default_config() -> Dict:
 def save_config(cfg: Dict):
     logger.info("Сохранение конфигурации (auto_lots.json)...")
     os.makedirs(os.path.dirname(CONFIG_PATH), exist_ok=True)
-    with open(CONFIG_PATH, 'w', encoding='utf-8') as f:
+    # review-fix: атомарная запись через .tmp + os.replace, чтобы при сбое
+    # питания не оставить пустой/обрезанный auto_lots.json.
+    tmp = f"{CONFIG_PATH}.tmp"
+    with open(tmp, 'w', encoding='utf-8') as f:
         json.dump(cfg, f, ensure_ascii=False, indent=4)
+    os.replace(tmp, CONFIG_PATH)
+    # review-fix: hot-reload lot_mapping и `config` без перезагрузки FPC.
+    # Раньше после добавления нового лота в TG-боте надо было перезапускать
+    # cardinal, иначе get_tg_id_by_description() не видела новых лотов
+    # (она читает глобальный `lot_mapping`, а тот обновлялся только в
+    # init_commands).
+    try:
+        _hot_reload_lot_mapping(cfg)
+    except Exception as _e:
+        logger.error(f"hot-reload lot_mapping failed: {_e}")
     logger.info("Конфигурация сохранена.")
+
+
+def _hot_reload_lot_mapping(cfg: Dict) -> None:
+    """
+    Применяет cfg['lot_mapping'] к глобальным lot_mapping/config in-place,
+    под общим _FILES_LOCK. Вызывается после каждого save_config().
+
+    После этой функции:
+      - get_tg_id_by_description() видит новый/изменённый/удалённый лот
+        мгновенно, без перезагрузки FPC;
+      - in-memory `config` отражает свежий cfg.
+    """
+    new_map = cfg.get("lot_mapping", {})
+    with _FILES_LOCK:
+        config.clear()
+        config.update(cfg)
+        lot_mapping.clear()
+        lot_mapping.update(new_map)
+    logger.info(
+        f"hot-reload lot_mapping: {len(new_map)} lot(s)",
+        extra={"event": "hot_reload_lot_mapping", "count": len(new_map)},
+    )
 
 def reindex_lots(cfg: Dict):
     lot_map = cfg.get("lot_mapping", {})
@@ -2126,18 +2168,85 @@ def auto_smm_handler(c: Cardinal, e, *args):
     if not RUNNING:
         return
 
-    # v10.2: топ-уровневый catch-all. Раньше любое исключение в ветке
+    # v10.2 + review-fix: топ-уровневый catch-all. Раньше любое исключение в ветке
     # await_confirm/процесса заказа всплывало в FPC-Cardinal и тихо
     # глоталось — пользователь видел тишину на «+».
+    #
+    # review-fix: если плагин уже сказал покупателю «🚀 Запускаю заказ...» и
+    # упал ДО создания заказа в SMM-сервисе — раньше покупатель оставался
+    # в подвешенном состоянии. Теперь catch-all:
+    #   1) информирует покупателя текстом с понятной причиной,
+    #   2) пытается auto-refund (если включён) или хотя бы алертит админа,
+    #   3) чистит waiting_for_link, чтобы next-message не попал в этот же
+    #      «битый» order_id.
     try:
         return _auto_smm_handler_inner(c, e, *args)
     except Exception as ex:
         logger.exception(f"auto_smm_handler crashed: {ex}", extra={"event": "handler_crash"})
+        if not isinstance(e, NewMessageEvent):
+            return
+        msg_chat_id = e.message.chat_id
+        msg_author_id = e.message.author_id
+
+        # Ищем pending-заказ этого покупателя, который мог быть в обработке.
+        crashed_order_id: Optional[str] = None
         try:
-            if isinstance(e, NewMessageEvent):
-                c.send_message(e.message.chat_id, "❌ Внутренняя ошибка обработки. Админ оповещён.")
+            with _FILES_LOCK:
+                for oid, data in list(waiting_for_link.items()):
+                    if (str(data.get("buyer_id")) == str(msg_author_id)
+                            or str(data.get("chat_id") or "") == str(msg_chat_id)):
+                        crashed_order_id = oid
+                        break
         except Exception:
             pass
+
+        # 1) Покупателю — внятное сообщение.
+        try:
+            if crashed_order_id:
+                c.send_message(
+                    msg_chat_id,
+                    "❌ Произошёл сбой при оформлении заказа. "
+                    "Сейчас попытаемся автоматически вернуть средства, "
+                    "если не получится — продавец оформит возврат вручную.",
+                )
+            else:
+                c.send_message(
+                    msg_chat_id,
+                    "❌ Внутренняя ошибка обработки сообщения. Продавец оповещён.",
+                )
+        except Exception:
+            pass
+
+        # 2) Авто-рефанд / алерт админу.
+        if crashed_order_id:
+            try:
+                refund_order(
+                    c,
+                    crashed_order_id,
+                    msg_chat_id,
+                    reason="Внутренний сбой плагина при оформлении заказа.",
+                    detailed_reason=f"auto_smm_handler crash: {type(ex).__name__}: {str(ex)[:200]}",
+                )
+            except Exception as ref_ex:
+                logger.exception(f"crash-recovery refund failed: {ref_ex}")
+                try:
+                    _admin_notify(
+                        f"🔥 <b>HANDLER CRASH + REFUND FAIL</b>\n"
+                        f"order: <code>{crashed_order_id}</code>\n"
+                        f"crash: {type(ex).__name__}: {str(ex)[:200]}\n"
+                        f"refund_err: {type(ref_ex).__name__}: {str(ref_ex)[:200]}\n"
+                        f"Зайди в чат с покупателем и оформи возврат вручную."
+                    )
+                except Exception:
+                    pass
+            # 3) Чистим waiting_for_link — даже если refund_order это уже
+            # сделал, повторный pop безопасен.
+            try:
+                with _FILES_LOCK:
+                    waiting_for_link.pop(str(crashed_order_id), None)
+                    save_state()
+            except Exception:
+                pass
 
 
 def _auto_smm_handler_inner(c: Cardinal, e, *args):
@@ -2292,7 +2401,47 @@ def _auto_smm_handler_inner(c: Cardinal, e, *args):
                         with _FILES_LOCK:
                             data["link"] = link_
                             save_state()
-                        process_link_without_confirmation(c, data)
+                        # review-fix: confirm_link=False / VIP-skip — тут тоже
+                        # должен быть guard. Если plwc упадёт, покупателю
+                        # ушло сообщение с принятой ссылкой и тишина.
+                        try:
+                            process_link_without_confirmation(c, data)
+                        except Exception as e_proc:
+                            logger.exception(
+                                f"process_link_without_confirmation (no-confirm) failed: {e_proc}",
+                                extra={"event": "plwc_fail_noconfirm", "order_id": order_id},
+                            )
+                            try:
+                                c.send_message(
+                                    msg_chat_id,
+                                    "❌ Произошёл сбой при оформлении заказа. "
+                                    "Сейчас попытаемся автоматически вернуть средства.",
+                                )
+                            except Exception:
+                                pass
+                            try:
+                                refund_order(
+                                    c, order_id, msg_chat_id,
+                                    reason="Сбой при оформлении заказа.",
+                                    detailed_reason=f"plwc_fail_noconfirm: {type(e_proc).__name__}: {str(e_proc)[:200]}",
+                                )
+                            except Exception as ref_ex:
+                                logger.exception(f"plwc_fail_noconfirm refund failed: {ref_ex}")
+                                try:
+                                    _admin_notify(
+                                        f"🔥 <b>plwc CRASH (no-confirm) + REFUND FAIL</b>\n"
+                                        f"order: <code>{order_id}</code>\n"
+                                        f"crash: {type(e_proc).__name__}: {str(e_proc)[:200]}\n"
+                                        f"refund_err: {type(ref_ex).__name__}: {str(ref_ex)[:200]}"
+                                    )
+                                except Exception:
+                                    pass
+                            try:
+                                with _FILES_LOCK:
+                                    waiting_for_link.pop(str(order_id), None)
+                                    save_state()
+                            except Exception:
+                                pass
                     return
 
                 elif data["step"] == "await_confirm":
@@ -2313,12 +2462,46 @@ def _auto_smm_handler_inner(c: Cardinal, e, *args):
                         try:
                             process_link_without_confirmation(c, data)
                         except Exception as e_proc:
+                            # review-fix: раньше при падении тут покупатель видел
+                            # «❌ Ошибка при оформлении заказа: <traceback>» и оставался
+                            # в подвешенном waiting_for_link с уже потраченными деньгами.
+                            # Теперь:
+                            #   1) понятный текст без trace,
+                            #   2) auto-refund (если включён) или алерт админу,
+                            #   3) удаление записи, чтобы повторный «+» не зацикливал.
                             logger.exception(
                                 f"process_link_without_confirmation failed: {e_proc}",
                                 extra={"event": "plwc_fail", "order_id": order_id},
                             )
                             try:
-                                c.send_message(msg_chat_id, f"❌ Ошибка при оформлении заказа: {e_proc}")
+                                c.send_message(
+                                    msg_chat_id,
+                                    "❌ Произошёл сбой при оформлении заказа. "
+                                    "Сейчас попытаемся автоматически вернуть средства.",
+                                )
+                            except Exception:
+                                pass
+                            try:
+                                refund_order(
+                                    c, order_id, msg_chat_id,
+                                    reason="Сбой при оформлении заказа.",
+                                    detailed_reason=f"plwc_fail: {type(e_proc).__name__}: {str(e_proc)[:200]}",
+                                )
+                            except Exception as ref_ex:
+                                logger.exception(f"plwc_fail refund failed: {ref_ex}")
+                                try:
+                                    _admin_notify(
+                                        f"🔥 <b>plwc CRASH + REFUND FAIL</b>\n"
+                                        f"order: <code>{order_id}</code>\n"
+                                        f"crash: {type(e_proc).__name__}: {str(e_proc)[:200]}\n"
+                                        f"refund_err: {type(ref_ex).__name__}: {str(ref_ex)[:200]}"
+                                    )
+                                except Exception:
+                                    pass
+                            try:
+                                with _FILES_LOCK:
+                                    waiting_for_link.pop(str(order_id), None)
+                                    save_state()
                             except Exception:
                                 pass
                         return
@@ -2601,26 +2784,26 @@ def auto_smm_settings(message: types.Message):
     kb = InlineKeyboardMarkup(row_width=2)
     
     kb.add(
-        InlineKeyboardButton("🛍️ Каталог лотов", callback_data="lot_settings"),
-        InlineKeyboardButton("➕ Создать новый лот", callback_data="add_new_lot")
+        InlineKeyboardButton("🛍️ Каталог лотов", callback_data="asmm:lot_settings"),
+        InlineKeyboardButton("➕ Создать новый лот", callback_data="asmm:add_new_lot")
     )
     
     kb.add(
-        InlineKeyboardButton("🔌 Интеграция API", callback_data="api_settings"),
+        InlineKeyboardButton("🔌 Интеграция API", callback_data="asmm:api_settings"),
     )
     
     kb.add(
-        InlineKeyboardButton("🌐 Доверенные сайты", callback_data="manage_websites"),
-        InlineKeyboardButton("💬 Шаблоны сообщений", callback_data="edit_messages")
+        InlineKeyboardButton("🌐 Доверенные сайты", callback_data="asmm:manage_websites"),
+        InlineKeyboardButton("💬 Шаблоны сообщений", callback_data="asmm:edit_messages")
     )
     
     kb.add(
-        InlineKeyboardButton("📊 Бэкап и аналитика", callback_data="files_menu"),
-        InlineKeyboardButton("⚙️ Тонкая настройка", callback_data="misc_settings")
+        InlineKeyboardButton("📊 Бэкап и аналитика", callback_data="asmm:files_menu"),
+        InlineKeyboardButton("⚙️ Тонкая настройка", callback_data="asmm:misc_settings")
     )
     
     kb.add(
-        InlineKeyboardButton("📚 Полезные ресурсы", callback_data="links_menu")
+        InlineKeyboardButton("📚 Полезные ресурсы", callback_data="asmm:links_menu")
     )
     
     bot.send_message(message.chat.id, txt_, parse_mode='HTML', reply_markup=kb)
@@ -2636,16 +2819,16 @@ def files_menu(call: types.CallbackQuery):
     kb_ = InlineKeyboardMarkup(row_width=2)
     
     kb_.row(
-        InlineKeyboardButton("📤 Экспорт файлов", callback_data="export_files"),
-        InlineKeyboardButton("📥 Загрузить JSON", callback_data="upload_lots_json")
+        InlineKeyboardButton("📤 Экспорт файлов", callback_data="asmm:export_files"),
+        InlineKeyboardButton("📥 Загрузить JSON", callback_data="asmm:upload_lots_json")
     )
     
     kb_.row(
-        InlineKeyboardButton("📝 Логи ошибок", callback_data="export_errors"),
-        InlineKeyboardButton("🗑 Удалить заказы", callback_data="delete_orders")
+        InlineKeyboardButton("📝 Логи ошибок", callback_data="asmm:export_errors"),
+        InlineKeyboardButton("🗑 Удалить заказы", callback_data="asmm:delete_orders")
     )
     
-    kb_.add(InlineKeyboardButton("🔙 Вернуться в настройки", callback_data="return_to_settings"))
+    kb_.add(InlineKeyboardButton("🔙 Вернуться в настройки", callback_data="asmm:return_to_settings"))
     
     bot.edit_message_text(txt_, call.message.chat.id, call.message.message_id, parse_mode='HTML', reply_markup=kb_)
 
@@ -2674,27 +2857,27 @@ def misc_settings(call: types.CallbackQuery):
     kb_ = InlineKeyboardMarkup(row_width=1)
     
     kb_.add(
-        InlineKeyboardButton(f"🔄 {'Выключить' if auto_refunds else 'Включить'} автовозвраты", callback_data="toggle_auto_refunds"),
-        InlineKeyboardButton(f"✅ {'Выключить' if confirm_link else 'Включить'} подтверждение ссылки", callback_data="toggle_confirm_link")
+        InlineKeyboardButton(f"🔄 {'Выключить' if auto_refunds else 'Включить'} автовозвраты", callback_data="asmm:toggle_auto_refunds"),
+        InlineKeyboardButton(f"✅ {'Выключить' if confirm_link else 'Включить'} подтверждение ссылки", callback_data="asmm:toggle_confirm_link")
     )
     
     kb_.add(
-        InlineKeyboardButton(f"📤 {'Выключить' if send_auto_lots else 'Включить'} отправку auto_lots.json", callback_data="toggle_send_auto_lots"),
-        InlineKeyboardButton("⏱️ Изменить интервал отправки", callback_data="change_send_interval")
+        InlineKeyboardButton(f"📤 {'Выключить' if send_auto_lots else 'Включить'} отправку auto_lots.json", callback_data="asmm:toggle_send_auto_lots"),
+        InlineKeyboardButton("⏱️ Изменить интервал отправки", callback_data="asmm:change_send_interval")
     )
     
     kb_.add(
-        InlineKeyboardButton(f"🚀 {'Выключить' if auto_start else 'Включить'} автозапуск плагина", callback_data="toggle_auto_start"),
-        InlineKeyboardButton("🔄 Обновить номера лотов", callback_data="update_lot_ids")
+        InlineKeyboardButton(f"🚀 {'Выключить' if auto_start else 'Включить'} автозапуск плагина", callback_data="asmm:toggle_auto_start"),
+        InlineKeyboardButton("🔄 Обновить номера лотов", callback_data="asmm:update_lot_ids")
     )
     
     kb_.add(
-        InlineKeyboardButton("🗑 Удалить все лоты", callback_data="delete_all_lots"),
-        InlineKeyboardButton("📩 Указать Chat ID для уведомлений", callback_data="set_notification_chat_id")
+        InlineKeyboardButton("🗑 Удалить все лоты", callback_data="asmm:delete_all_lots"),
+        InlineKeyboardButton("📩 Указать Chat ID для уведомлений", callback_data="asmm:set_notification_chat_id")
     )
     
     kb_.add(
-        InlineKeyboardButton("🔙 Вернуться в настройки", callback_data="return_to_settings")
+        InlineKeyboardButton("🔙 Вернуться в настройки", callback_data="asmm:return_to_settings")
     )
     
     bot.edit_message_text(txt_, call.message.chat.id, call.message.message_id, parse_mode='HTML', reply_markup=kb_)
@@ -2714,7 +2897,7 @@ def links_menu(call: types.CallbackQuery):
         InlineKeyboardButton("🌐 Vexboost", url="https://vexboost.ru")
     )
 
-    kb_.add(InlineKeyboardButton("🔙 Вернуться в настройки", callback_data="return_to_settings"))
+    kb_.add(InlineKeyboardButton("🔙 Вернуться в настройки", callback_data="asmm:return_to_settings"))
     
     bot.edit_message_text(txt_, call.message.chat.id, call.message.message_id, parse_mode='HTML', reply_markup=kb_)
 
@@ -2785,18 +2968,18 @@ def generate_lots_keyboard(page: int = 0) -> InlineKeyboardMarkup:
         qty_ = lot_data["quantity"]
         snum_ = lot_data.get("service_number", 1)
         btn_text = f"{name_} [ID={sid_}, Q={qty_}, S={snum_}]"
-        cd_ = f"edit_lot_{lot_key}"
+        cd_ = f"asmm:edit_lot:{lot_key}"
         kb_.add(InlineKeyboardButton(btn_text, callback_data=cd_))
 
     nav_buttons = []
     if page > 0:
-        nav_buttons.append(InlineKeyboardButton("⬅️", callback_data=f"prev_page_{page-1}"))
+        nav_buttons.append(InlineKeyboardButton("⬅️", callback_data=f"asmm:prev_page:{page-1}"))
     if end_ < len(items):
-        nav_buttons.append(InlineKeyboardButton("➡️", callback_data=f"next_page_{page+1}"))
+        nav_buttons.append(InlineKeyboardButton("➡️", callback_data=f"asmm:next_page:{page+1}"))
     if nav_buttons:
         kb_.row(*nav_buttons)
 
-    kb_.add(InlineKeyboardButton("🔙 Назад", callback_data="return_to_settings"))
+    kb_.add(InlineKeyboardButton("🔙 Назад", callback_data="asmm:return_to_settings"))
     return kb_
 
 def edit_lot(call: types.CallbackQuery, lot_key: str):
@@ -2817,13 +3000,13 @@ S#: <code>{ld_.get('service_number', 1)}</code>
 
     kb_ = InlineKeyboardMarkup(row_width=1)
     kb_.add(
-        InlineKeyboardButton("Изменить название", callback_data=f"change_name_{lot_key}"),
-        InlineKeyboardButton("Изменить ID услуги", callback_data=f"change_id_{lot_key}"),
-        InlineKeyboardButton("Изменить количество", callback_data=f"change_quantity_{lot_key}"),
-        InlineKeyboardButton("Изменить сервис#", callback_data=f"change_snum_{lot_key}"),
+        InlineKeyboardButton("Изменить название", callback_data=f"asmm:change_name:{lot_key}"),
+        InlineKeyboardButton("Изменить ID услуги", callback_data=f"asmm:change_id:{lot_key}"),
+        InlineKeyboardButton("Изменить количество", callback_data=f"asmm:change_quantity:{lot_key}"),
+        InlineKeyboardButton("Изменить сервис#", callback_data=f"asmm:change_snum:{lot_key}"),
     )
-    kb_.add(InlineKeyboardButton("❌ Удалить лот", callback_data=f"delete_one_lot_{lot_key}"))
-    kb_.add(InlineKeyboardButton("◀️ К списку", callback_data="return_to_lots"))
+    kb_.add(InlineKeyboardButton("❌ Удалить лот", callback_data=f"asmm:delete_one_lot:{lot_key}"))
+    kb_.add(InlineKeyboardButton("◀️ К списку", callback_data="asmm:return_to_lots"))
     bot.edit_message_text(txt_, call.message.chat.id, call.message.message_id, parse_mode="HTML", reply_markup=kb_)
 
 def delete_one_lot(call: types.CallbackQuery, lot_key: str):
@@ -2869,7 +3052,7 @@ def process_name_change(message: types.Message, lot_key: str):
     cfg["lot_mapping"] = lot_map
     save_config(cfg)
     kb_ = InlineKeyboardMarkup()
-    kb_.add(InlineKeyboardButton("◀️ К лотам", callback_data="return_to_lots"))
+    kb_.add(InlineKeyboardButton("◀️ К лотам", callback_data="asmm:return_to_lots"))
     bot.send_message(message.chat.id, f"✅ Название лота {lot_key} изменено на {new_name}.", reply_markup=kb_)
 
 def process_id_change(message: types.Message, lot_key: str):
@@ -2887,7 +3070,7 @@ def process_id_change(message: types.Message, lot_key: str):
     cfg["lot_mapping"] = lot_map
     save_config(cfg)
     kb_ = InlineKeyboardMarkup()
-    kb_.add(InlineKeyboardButton("◀️ К лотам", callback_data="return_to_lots"))
+    kb_.add(InlineKeyboardButton("◀️ К лотам", callback_data="asmm:return_to_lots"))
     bot.send_message(message.chat.id, f"✅ ID услуги для {lot_key} изменён на {new_id}.", reply_markup=kb_)
 
 def process_quantity_change(message: types.Message, lot_key: str):
@@ -2905,7 +3088,7 @@ def process_quantity_change(message: types.Message, lot_key: str):
     cfg["lot_mapping"] = lot_map
     save_config(cfg)
     kb_ = InlineKeyboardMarkup()
-    kb_.add(InlineKeyboardButton("◀️ К лотам", callback_data="return_to_lots"))
+    kb_.add(InlineKeyboardButton("◀️ К лотам", callback_data="asmm:return_to_lots"))
     bot.send_message(message.chat.id, f"✅ Количество для {lot_key} изменено на {new_q}.", reply_markup=kb_)
 
 def process_service_num_change(message: types.Message, lot_key: str):
@@ -2923,7 +3106,7 @@ def process_service_num_change(message: types.Message, lot_key: str):
         cfg["lot_mapping"] = lot_map
         save_config(cfg)
         kb_ = InlineKeyboardMarkup()
-        kb_.add(InlineKeyboardButton("◀️ К лотам", callback_data="return_to_lots"))
+        kb_.add(InlineKeyboardButton("◀️ К лотам", callback_data="asmm:return_to_lots"))
         bot.send_message(message.chat.id, f"✅ Номер сервиса для {lot_key} изменён на {new_snum}.", reply_markup=kb_)
     except ValueError:
         bot.send_message(message.chat.id, "❌ Ошибка: Введите номер сервиса (число).")
@@ -2984,7 +3167,7 @@ def process_new_lot_id_step(message: types.Message):
         save_config(cfg)
 
         kb_ = InlineKeyboardMarkup()
-        kb_.add(InlineKeyboardButton("🔙 К настройкам", callback_data="return_to_settings"))
+        kb_.add(InlineKeyboardButton("🔙 К настройкам", callback_data="asmm:return_to_settings"))
         bot.send_message(message.chat.id, f"✅ Добавлен новый лот {new_lot_key} с названием: {name}", reply_markup=kb_)
     except Exception as e:
         logger.exception(f"process_new_lot_id_step crashed: {e}")
@@ -3014,33 +3197,33 @@ def api_settings_menu(call):
 
     kb = InlineKeyboardMarkup(row_width=2)
     
-    kb.row(InlineKeyboardButton("📡 API URLs (показать все)", callback_data="show_all_api_urls"))
+    kb.row(InlineKeyboardButton("📡 API URLs (показать все)", callback_data="asmm:show_all_api_urls"))
     
     api_buttons = []
     for srv_num in services:
-        api_buttons.append(InlineKeyboardButton(f"Сервис #{srv_num}", callback_data=f"edit_apiurl_{srv_num}"))
+        api_buttons.append(InlineKeyboardButton(f"Сервис #{srv_num}", callback_data=f"asmm:edit_apiurl:{srv_num}"))
     kb.add(*api_buttons)
     
-    kb.row(InlineKeyboardButton("🔑 API Keys (показать все)", callback_data="show_all_api_keys"))
+    kb.row(InlineKeyboardButton("🔑 API Keys (показать все)", callback_data="asmm:show_all_api_keys"))
     
     key_buttons = []
     for srv_num in services:
-        key_buttons.append(InlineKeyboardButton(f"Ключ #{srv_num}", callback_data=f"edit_apikey_{srv_num}"))
+        key_buttons.append(InlineKeyboardButton(f"Ключ #{srv_num}", callback_data=f"asmm:edit_apikey:{srv_num}"))
     kb.add(*key_buttons)
     
-    kb.row(InlineKeyboardButton("💰 Балансы всех сервисов", callback_data="check_all_balances"))
+    kb.row(InlineKeyboardButton("💰 Балансы всех сервисов", callback_data="asmm:check_all_balances"))
     
     balance_buttons = []
     for srv_num in services:
-        balance_buttons.append(InlineKeyboardButton(f"Баланс #{srv_num}", callback_data=f"check_balance_{srv_num}"))
+        balance_buttons.append(InlineKeyboardButton(f"Баланс #{srv_num}", callback_data=f"asmm:check_balance:{srv_num}"))
     kb.add(*balance_buttons)
     
     kb.row(
-        InlineKeyboardButton("➕ Добавить сервис", callback_data="add_service"),
-        InlineKeyboardButton("🗑 Удалить сервис", callback_data="delete_service")
+        InlineKeyboardButton("➕ Добавить сервис", callback_data="asmm:add_service"),
+        InlineKeyboardButton("🗑 Удалить сервис", callback_data="asmm:delete_service")
     )
     
-    kb.add(InlineKeyboardButton("🔙 Вернуться в настройки", callback_data="return_to_settings"))
+    kb.add(InlineKeyboardButton("🔙 Вернуться в настройки", callback_data="asmm:return_to_settings"))
 
     bot.edit_message_text(text_, call.message.chat.id, call.message.message_id, parse_mode="HTML", reply_markup=kb)
 
@@ -3050,14 +3233,14 @@ def process_apiurl_change(message: types.Message, service_idx: int):
     
     if not new_url.startswith(("http://", "https://")):
         kb_ = InlineKeyboardMarkup()
-        kb_.add(InlineKeyboardButton("🔙 К настройкам API", callback_data="api_settings"))
+        kb_.add(InlineKeyboardButton("🔙 К настройкам API", callback_data="asmm:api_settings"))
         bot.send_message(message.chat.id, "❌ URL должен начинаться с http:// или https://", reply_markup=kb_)
         return
         
     cfg = load_config()
     if str(service_idx) not in cfg["services"]:
         kb_ = InlineKeyboardMarkup()
-        kb_.add(InlineKeyboardButton("🔙 К настройкам API", callback_data="api_settings"))
+        kb_.add(InlineKeyboardButton("🔙 К настройкам API", callback_data="asmm:api_settings"))
         bot.send_message(message.chat.id, f"❌ Сервис #{service_idx} не найден в конфигурации.", reply_markup=kb_)
         return
         
@@ -3067,8 +3250,8 @@ def process_apiurl_change(message: types.Message, service_idx: int):
     
     kb_ = InlineKeyboardMarkup(row_width=1)
     kb_.add(
-        InlineKeyboardButton("✅ Проверить баланс", callback_data=f"check_balance_{service_idx}"),
-        InlineKeyboardButton("🔙 К настройкам API", callback_data="api_settings")
+        InlineKeyboardButton("✅ Проверить баланс", callback_data=f"asmm:check_balance:{service_idx}"),
+        InlineKeyboardButton("🔙 К настройкам API", callback_data="asmm:api_settings")
     )
     
     text_ = f"""
@@ -3088,14 +3271,14 @@ def process_apikey_change(message: types.Message, service_idx: int):
     
     if not new_key:
         kb_ = InlineKeyboardMarkup()
-        kb_.add(InlineKeyboardButton("🔙 К настройкам API", callback_data="api_settings"))
+        kb_.add(InlineKeyboardButton("🔙 К настройкам API", callback_data="asmm:api_settings"))
         bot.send_message(message.chat.id, "❌ API ключ не может быть пустым", reply_markup=kb_)
         return
         
     cfg = load_config()
     if str(service_idx) not in cfg["services"]:
         kb_ = InlineKeyboardMarkup()
-        kb_.add(InlineKeyboardButton("🔙 К настройкам API", callback_data="api_settings"))
+        kb_.add(InlineKeyboardButton("🔙 К настройкам API", callback_data="asmm:api_settings"))
         bot.send_message(message.chat.id, f"❌ Сервис #{service_idx} не найден в конфигурации.", reply_markup=kb_)
         return
     
@@ -3108,8 +3291,8 @@ def process_apikey_change(message: types.Message, service_idx: int):
     
     kb_ = InlineKeyboardMarkup(row_width=1)
     kb_.add(
-        InlineKeyboardButton("✅ Проверить баланс", callback_data=f"check_balance_{service_idx}"),
-        InlineKeyboardButton("🔙 К настройкам API", callback_data="api_settings")
+        InlineKeyboardButton("✅ Проверить баланс", callback_data=f"asmm:check_balance:{service_idx}"),
+        InlineKeyboardButton("🔙 К настройкам API", callback_data="asmm:api_settings")
     )
     
     text_ = f"""
@@ -3152,23 +3335,23 @@ def check_balance_func(call: types.CallbackQuery, service_idx: int):
         """.strip()
         
         kb_ = InlineKeyboardMarkup()
-        kb_.add(InlineKeyboardButton("🔙 К настройкам API", callback_data="api_settings"))
+        kb_.add(InlineKeyboardButton("🔙 К настройкам API", callback_data="asmm:api_settings"))
         
         bot.edit_message_text(text_, call.message.chat.id, call.message.message_id, 
                              parse_mode="HTML", reply_markup=kb_)
                              
     except requests.exceptions.Timeout:
         kb_ = InlineKeyboardMarkup()
-        kb_.add(InlineKeyboardButton("🔄 Повторить", callback_data=f"check_balance_{service_idx}"))
-        kb_.add(InlineKeyboardButton("🔙 К настройкам API", callback_data="api_settings"))
+        kb_.add(InlineKeyboardButton("🔄 Повторить", callback_data=f"asmm:check_balance:{service_idx}"))
+        kb_.add(InlineKeyboardButton("🔙 К настройкам API", callback_data="asmm:api_settings"))
         
         bot.edit_message_text(f"⚠️ Время ожидания ответа от сервиса #{service_idx} истекло.",
                              call.message.chat.id, call.message.message_id, reply_markup=kb_)
                              
     except Exception as e:
         kb_ = InlineKeyboardMarkup()
-        kb_.add(InlineKeyboardButton("🔄 Повторить", callback_data=f"check_balance_{service_idx}"))
-        kb_.add(InlineKeyboardButton("🔙 К настройкам API", callback_data="api_settings"))
+        kb_.add(InlineKeyboardButton("🔄 Повторить", callback_data=f"asmm:check_balance:{service_idx}"))
+        kb_.add(InlineKeyboardButton("🔙 К настройкам API", callback_data="asmm:api_settings"))
         
         bot.edit_message_text(f"❌ Ошибка при запросе баланса сервиса #{service_idx}:\n<code>{str(e)[:100]}</code>", 
                              call.message.chat.id, call.message.message_id, 
@@ -3201,7 +3384,7 @@ def show_all_api_urls_func(call: types.CallbackQuery):
                 host = url
             lines.append(f"• <b>Сервис #{srv_num}</b>: <code>{html.escape(url)}</code> ({html.escape(host)})")
     kb_ = InlineKeyboardMarkup()
-    kb_.add(InlineKeyboardButton("🔙 К настройкам API", callback_data="api_settings"))
+    kb_.add(InlineKeyboardButton("🔙 К настройкам API", callback_data="asmm:api_settings"))
     bot.edit_message_text("\n".join(lines), call.message.chat.id, call.message.message_id,
                           parse_mode="HTML", reply_markup=kb_)
 
@@ -3220,7 +3403,7 @@ def show_all_api_keys_func(call: types.CallbackQuery):
             status = "✅" if key else "❌"
             lines.append(f"• <b>Сервис #{srv_num}</b>: {status} <code>{html.escape(_mask_api_key(key))}</code>")
     kb_ = InlineKeyboardMarkup()
-    kb_.add(InlineKeyboardButton("🔙 К настройкам API", callback_data="api_settings"))
+    kb_.add(InlineKeyboardButton("🔙 К настройкам API", callback_data="asmm:api_settings"))
     bot.edit_message_text("\n".join(lines), call.message.chat.id, call.message.message_id,
                           parse_mode="HTML", reply_markup=kb_)
 
@@ -3234,7 +3417,7 @@ def check_all_balances_func(call: types.CallbackQuery):
 
     if not services:
         kb_ = InlineKeyboardMarkup()
-        kb_.add(InlineKeyboardButton("🔙 К настройкам API", callback_data="api_settings"))
+        kb_.add(InlineKeyboardButton("🔙 К настройкам API", callback_data="asmm:api_settings"))
         bot.edit_message_text("Сервисов пока не добавлено.",
                               call.message.chat.id, call.message.message_id, reply_markup=kb_)
         return
@@ -3268,8 +3451,8 @@ def check_all_balances_func(call: types.CallbackQuery):
     lines.extend(total_lines)
     kb_ = InlineKeyboardMarkup(row_width=2)
     kb_.add(
-        InlineKeyboardButton("🔄 Обновить", callback_data="check_all_balances"),
-        InlineKeyboardButton("🔙 К настройкам API", callback_data="api_settings"),
+        InlineKeyboardButton("🔄 Обновить", callback_data="asmm:check_all_balances"),
+        InlineKeyboardButton("🔙 К настройкам API", callback_data="asmm:api_settings"),
     )
     bot.edit_message_text("\n".join(lines), call.message.chat.id, call.message.message_id,
                           parse_mode="HTML", reply_markup=kb_)
@@ -3317,16 +3500,22 @@ def init_commands(c_: Cardinal):
     if auto_started:
         logger.info("Плагин был автоматически запущен при инициализации")
 
-    @bot.message_handler(content_types=['document'])
+    # review-fix: раньше handler ловил ЛЮБОЙ документ от ЛЮБОГО пользователя
+    # (включая документы для других плагинов или штатного ПУ FPC) и отвечал
+    # "❌ Вы не активировали загрузку JSON". Теперь активен только для админов
+    # FPC, которые явно нажали "📥 Загрузить JSON".
+    @bot.message_handler(
+        content_types=['document'],
+        func=lambda m: (
+            getattr(m, "from_user", None) is not None
+            and m.from_user.id in waiting_for_lots_upload
+            and _is_admin_message(m)
+        ),
+    )
     def handle_document_upload(message: types.Message):
         user_id = message.from_user.id
-        logger.info(f"Получен документ от {user_id}. Проверка ожидания...")
-        if user_id not in waiting_for_lots_upload:
-            logger.info(f"Пользователь {user_id} не ожидает загрузки JSON")
-            bot.send_message(message.chat.id, "❌ Вы не активировали загрузку JSON. Используйте меню настроек.")
-            return
-        waiting_for_lots_upload.remove(user_id)
-        logger.info(f"Пользователь {user_id} удалён из ожидания. Обрабатываю файл...")
+        logger.info(f"Получен документ от {user_id}. Обрабатываю файл...")
+        waiting_for_lots_upload.discard(user_id)
         file_id = message.document.file_id
         file_info = bot.get_file(file_id)
         downloaded_file = bot.download_file(file_info.file_path)
@@ -3337,8 +3526,10 @@ def init_commands(c_: Cardinal):
                 logger.error("JSON не содержит 'lot_mapping'")
                 return
             save_config(data)
+            # review-fix: hot-reload вызывается уже внутри save_config(),
+            # так что после этой строки in-memory lot_mapping актуален.
             kb_ = InlineKeyboardMarkup()
-            kb_.add(InlineKeyboardButton("🔙 Назад", callback_data="return_to_settings"))
+            kb_.add(InlineKeyboardButton("🔙 Назад", callback_data="asmm:return_to_settings"))
             bot.send_message(message.chat.id, "✅ Новый auto_lots.json успешно загружен и сохранён!", reply_markup=kb_)
             logger.info("JSON успешно загружен и сохранён")
         except json.JSONDecodeError as e:
@@ -3357,28 +3548,67 @@ def init_commands(c_: Cardinal):
         ("start_smm", "Включить автопродажу", True),
         ("stop_smm", "Выключить автопродажу", True),
         ("auto_smm_settings", "Настройки автопродажи", True),
-        ("auto_smm_delete", "Удалить файлы заказов", True)
+        ("auto_smm_delete", "Удалить файлы заказов", True),
+        # review-fix: остальные команды раньше регистрировались как msg_handler,
+        # но не отображались ни в карточке плагина, ни в меню Telegram.
+        ("autosmm_pnl", "P&L отчёт", False),
+        ("autosmm_top", "Топ покупателей", False),
+        ("autosmm_health", "Health-check сервисов", False),
+        ("autosmm_refill_now", "Принудительный refill-проход", False),
+        ("autosmm_rate", "Курс USD/RUB", False),
+        ("autosmm_customers", "Клиентские профили / VIP", False),
+        ("autosmm_errors", "Последние ошибки", False),
+        ("autosmm_pending", "Очередь pending_refunds", False),
     ])
 
-    @bot.callback_query_handler(func=lambda call: call.data == "manage_websites")
+    # review-fix: SETTINGS_PAGE = True → у плагина в карточке ПУ FPC появилась
+    # кнопка «Настройки». При нажатии FPC шлёт callback CBT.PLUGIN_SETTINGS:UUID:OFFSET.
+    # Переиспользуем существующий /auto_smm_settings — у него уже всё нужное.
+    try:
+        from tg_bot import CBT as _FPC_CBT  # imported here to avoid hard dep at import
+        _settings_cb_prefix = f"{_FPC_CBT.PLUGIN_SETTINGS}:{UUID}:"
+    except Exception as _e:
+        logger.error(f"FPC CBT import failed (settings button disabled): {_e}")
+        _settings_cb_prefix = None
+
+    if _settings_cb_prefix is not None:
+        @bot.callback_query_handler(func=lambda call: bool(_settings_cb_prefix) and call.data.startswith(_settings_cb_prefix))
+        def open_settings_from_pu(call: types.CallbackQuery):
+            try:
+                # auto_smm_settings ждёт telebot.types.Message — у callback-а в `.message`
+                # уже есть нужный chat.id, поэтому переиспользуем напрямую.
+                auto_smm_settings(call.message)
+            except Exception as e:
+                logger.exception(f"open_settings_from_pu failed: {e}")
+                try:
+                    bot.send_message(call.message.chat.id, f"❌ Не удалось открыть настройки: {e}")
+                except Exception:
+                    pass
+            try:
+                bot.answer_callback_query(call.id)
+            except Exception:
+                pass
+
+
+    @bot.callback_query_handler(func=lambda call: call.data == "asmm:manage_websites")
     def manage_websites(call: types.CallbackQuery):
         valid_links = load_valid_links()
         if valid_links:
             kb_ = InlineKeyboardMarkup(row_width=2)
             for site in valid_links:
                 kb_.add(
-                    InlineKeyboardButton(site, callback_data=f"delete_website_{site}"),
-                    InlineKeyboardButton("Удалить", callback_data=f"delete_website_{site}")
+                    InlineKeyboardButton(site, callback_data=f"asmm:delete_website:{site}"),
+                    InlineKeyboardButton("Удалить", callback_data=f"asmm:delete_website:{site}")
                 )
         else:
             kb_ = InlineKeyboardMarkup(row_width=1)
         
-        kb_.add(InlineKeyboardButton("➕ Добавить сайт", callback_data="add_website"))
-        kb_.add(InlineKeyboardButton("🔙 Назад", callback_data="return_to_settings"))
+        kb_.add(InlineKeyboardButton("➕ Добавить сайт", callback_data="asmm:add_website"))
+        kb_.add(InlineKeyboardButton("🔙 Назад", callback_data="asmm:return_to_settings"))
 
         bot.edit_message_text("Список разрешённых сайтов:", call.message.chat.id, call.message.message_id, reply_markup=kb_)
 
-    @bot.callback_query_handler(func=lambda call: call.data == "add_website")
+    @bot.callback_query_handler(func=lambda call: call.data == "asmm:add_website")
     def add_website_prompt(call: types.CallbackQuery):
         msg_ = bot.edit_message_text("Введите ссылку для добавления (например, example.com):", call.message.chat.id, call.message.message_id)
         bot.register_next_step_handler(msg_, process_add_website)
@@ -3387,12 +3617,12 @@ def init_commands(c_: Cardinal):
         new_site = message.text.strip()
         add_website(message, new_site)
         kb_ = InlineKeyboardMarkup()
-        kb_.add(InlineKeyboardButton("🔙 Вернуться в настройки", callback_data="return_to_settings"))
+        kb_.add(InlineKeyboardButton("🔙 Вернуться в настройки", callback_data="asmm:return_to_settings"))
         bot.send_message(message.chat.id, "Вернитесь в настройки для продолжения.", reply_markup=kb_)
 
-    @bot.callback_query_handler(func=lambda call: call.data.startswith("delete_website_"))
+    @bot.callback_query_handler(func=lambda call: call.data.startswith("asmm:delete_website:"))
     def remove_website_prompt(call: types.CallbackQuery):
-        site_to_remove = call.data.split("_", 2)[2]
+        site_to_remove = call.data.split(":", 2)[-1]
         valid_links = load_valid_links()
         if site_to_remove in valid_links:
             valid_links.remove(site_to_remove)
@@ -3402,39 +3632,39 @@ def init_commands(c_: Cardinal):
             bot.edit_message_text(f"❌ Сайт {site_to_remove} не найден в списке.", call.message.chat.id, call.message.message_id)
         manage_websites(call)
 
-    @bot.callback_query_handler(func=lambda call: call.data == "delete_all_lots")
+    @bot.callback_query_handler(func=lambda call: call.data == "asmm:delete_all_lots")
     def delete_all_lots_prompt(call: types.CallbackQuery):
         kb = InlineKeyboardMarkup()
         kb.add(
-            InlineKeyboardButton("Да, удалить", callback_data="confirm_delete_all_lots"),
-            InlineKeyboardButton("Нет, отменить", callback_data="return_to_settings")
+            InlineKeyboardButton("Да, удалить", callback_data="asmm:confirm_delete_all_lots"),
+            InlineKeyboardButton("Нет, отменить", callback_data="asmm:return_to_settings")
         )
         bot.edit_message_text("Вы уверены, что хотите удалить все лоты?", call.message.chat.id, call.message.message_id, reply_markup=kb)
 
-    @bot.callback_query_handler(func=lambda call: call.data == "confirm_delete_all_lots")
+    @bot.callback_query_handler(func=lambda call: call.data == "asmm:confirm_delete_all_lots")
     def confirm_delete_all_lots(call: types.CallbackQuery):
         delete_all_lots_func(call)
         kb = InlineKeyboardMarkup()
-        kb.add(InlineKeyboardButton("🔙 Назад", callback_data="return_to_settings"))
+        kb.add(InlineKeyboardButton("🔙 Назад", callback_data="asmm:return_to_settings"))
         bot.edit_message_text("Все лоты удалены.", call.message.chat.id, call.message.message_id, reply_markup=kb)
 
-    @bot.callback_query_handler(func=lambda call: call.data == "lot_settings")
+    @bot.callback_query_handler(func=lambda call: call.data == "asmm:lot_settings")
     def lot_settings(call: types.CallbackQuery):
         kb = InlineKeyboardMarkup(row_width=1)
-        kb.add(InlineKeyboardButton("🔍 Поиск лота", callback_data="search_lot"))
-        kb.add(InlineKeyboardButton("📋 Список лотов", callback_data="show_lots_list"))
-        kb.add(InlineKeyboardButton("🔙 Назад", callback_data="return_to_settings"))
+        kb.add(InlineKeyboardButton("🔍 Поиск лота", callback_data="asmm:search_lot"))
+        kb.add(InlineKeyboardButton("📋 Список лотов", callback_data="asmm:show_lots_list"))
+        kb.add(InlineKeyboardButton("🔙 Назад", callback_data="asmm:return_to_settings"))
         bot.edit_message_text("Управление лотами:", call.message.chat.id, call.message.message_id, reply_markup=kb)
 
-    @bot.callback_query_handler(func=lambda call: call.data == "show_lots_list")
+    @bot.callback_query_handler(func=lambda call: call.data == "asmm:show_lots_list")
     def show_lots_list(call: types.CallbackQuery):
         page = _save_lot_page(call.message.chat.id, _get_lot_page(call.message.chat.id))
         bot.edit_message_text("Выберите лот:", call.message.chat.id, call.message.message_id, reply_markup=generate_lots_keyboard(page))
 
-    @bot.callback_query_handler(func=lambda call: call.data == "search_lot")
+    @bot.callback_query_handler(func=lambda call: call.data == "asmm:search_lot")
     def search_lot_prompt(call: types.CallbackQuery):
         kb = InlineKeyboardMarkup()
-        kb.add(InlineKeyboardButton("🔙 Назад", callback_data="lot_settings"))
+        kb.add(InlineKeyboardButton("🔙 Назад", callback_data="asmm:lot_settings"))
         msg = bot.edit_message_text("Введите название или часть названия лота для поиска:", 
                                     call.message.chat.id, call.message.message_id, reply_markup=kb)
         bot.register_next_step_handler(msg, process_lot_search)
@@ -3443,7 +3673,7 @@ def init_commands(c_: Cardinal):
         search_term = message.text.strip().lower()
         if not search_term:
             kb = InlineKeyboardMarkup()
-            kb.add(InlineKeyboardButton("🔙 К настройкам лотов", callback_data="lot_settings"))
+            kb.add(InlineKeyboardButton("🔙 К настройкам лотов", callback_data="asmm:lot_settings"))
             bot.send_message(message.chat.id, "❌ Поисковый запрос не может быть пустым.", reply_markup=kb)
             return
             
@@ -3458,8 +3688,8 @@ def init_commands(c_: Cardinal):
                 
         if not found_lots:
             kb = InlineKeyboardMarkup()
-            kb.add(InlineKeyboardButton("🔍 Новый поиск", callback_data="search_lot"))
-            kb.add(InlineKeyboardButton("🔙 К настройкам лотов", callback_data="lot_settings"))
+            kb.add(InlineKeyboardButton("🔍 Новый поиск", callback_data="asmm:search_lot"))
+            kb.add(InlineKeyboardButton("🔙 К настройкам лотов", callback_data="asmm:lot_settings"))
             bot.send_message(message.chat.id, f"❌ Лоты с названием '{search_term}' не найдены.", reply_markup=kb)
             return
             
@@ -3470,38 +3700,38 @@ def init_commands(c_: Cardinal):
             qty_ = lot_data["quantity"]
             snum_ = lot_data.get("service_number", 1)
             btn_text = f"{name_} [ID={sid_}, Q={qty_}, S={snum_}]"
-            cd_ = f"edit_lot_{lot_key}"
+            cd_ = f"asmm:edit_lot:{lot_key}"
             kb.add(InlineKeyboardButton(btn_text, callback_data=cd_))
             
-        kb.add(InlineKeyboardButton("🔍 Новый поиск", callback_data="search_lot"))
-        kb.add(InlineKeyboardButton("🔙 К настройкам лотов", callback_data="lot_settings"))
+        kb.add(InlineKeyboardButton("🔍 Новый поиск", callback_data="asmm:search_lot"))
+        kb.add(InlineKeyboardButton("🔙 К настройкам лотов", callback_data="asmm:lot_settings"))
         bot.send_message(message.chat.id, f"🔍 Результаты поиска для '{search_term}':", reply_markup=kb)
 
-    @bot.callback_query_handler(func=lambda call: call.data.startswith("edit_lot_"))
+    @bot.callback_query_handler(func=lambda call: call.data.startswith("asmm:edit_lot:"))
     def edit_lot_callback(call: types.CallbackQuery):
-        lot_key = call.data.split("_", 2)[2]
+        lot_key = call.data.split(":", 2)[-1]
         edit_lot(call, lot_key)
 
-    @bot.callback_query_handler(func=lambda call: call.data.startswith("prev_page_") or call.data.startswith("next_page_"))
+    @bot.callback_query_handler(func=lambda call: call.data.startswith("asmm:prev_page:") or call.data.startswith("asmm:next_page:"))
     def page_navigation(call: types.CallbackQuery):
         try:
-            page_ = int(call.data.split("_")[-1])
+            page_ = int(call.data.split(":")[-1])
         except ValueError:
             page_ = 0
         page_ = _save_lot_page(call.message.chat.id, page_)
         bot.edit_message_text("Выберите лот:", call.message.chat.id, call.message.message_id, reply_markup=generate_lots_keyboard(page_))
 
-    @bot.callback_query_handler(func=lambda call: call.data == "show_orders")
+    @bot.callback_query_handler(func=lambda call: call.data == "asmm:show_orders")
     def show_orders(call: types.CallbackQuery):
         stats = get_statistics()
         if not stats:
             kb = InlineKeyboardMarkup()
-            kb.add(InlineKeyboardButton("🔙 Назад", callback_data="return_to_settings"))
+            kb.add(InlineKeyboardButton("🔙 Назад", callback_data="asmm:return_to_settings"))
             bot.edit_message_text("❌ Нет данных о заказах.", call.message.chat.id, call.message.message_id, reply_markup=kb)
             return
 
         kb = InlineKeyboardMarkup()
-        kb.add(InlineKeyboardButton("🔙 Назад", callback_data="return_to_settings"))
+        kb.add(InlineKeyboardButton("🔙 Назад", callback_data="asmm:return_to_settings"))
 
         text = f"""
 📊 <b>Информация о заказах SMM</b>
@@ -3520,14 +3750,14 @@ def init_commands(c_: Cardinal):
         
         bot.answer_callback_query(call.id)
 
-    @bot.callback_query_handler(func=lambda call: call.data == "upload_lots_json")
+    @bot.callback_query_handler(func=lambda call: call.data == "asmm:upload_lots_json")
     def upload_lots_json(call: types.CallbackQuery):
         user_id = call.from_user.id
         waiting_for_lots_upload.add(user_id)
         logger.info(f"Добавлен пользователь {user_id} в waiting_for_lots_upload: {waiting_for_lots_upload}")
         bot.edit_message_text("Пришлите файл JSON (можно любым названием).", call.message.chat.id, call.message.message_id)
 
-    @bot.callback_query_handler(func=lambda call: call.data == "export_files")
+    @bot.callback_query_handler(func=lambda call: call.data == "asmm:export_files")
     def export_files(call: types.CallbackQuery):
         chat_id_ = call.message.chat.id
         # v10.1 FIX: orders_data.json после миграции переименован в .legacy.bak,
@@ -3554,7 +3784,7 @@ def init_commands(c_: Cardinal):
                     bot.send_message(chat_id_, f"Ошибка отправки {os.path.basename(f_)}: {e}")
             # отсутствующие файлы (например customers.json до первого VIP) тихо пропускаем
 
-    @bot.callback_query_handler(func=lambda call: call.data == "export_errors")
+    @bot.callback_query_handler(func=lambda call: call.data == "asmm:export_errors")
     def export_errors(call: types.CallbackQuery):
         chat_id_ = call.message.chat.id
         if os.path.exists(LOG_PATH):
@@ -3567,7 +3797,7 @@ def init_commands(c_: Cardinal):
         else:
             bot.edit_message_text("Лог-файл не найден.", chat_id_, call.message.message_id)
 
-    @bot.callback_query_handler(func=lambda call: call.data == "delete_orders")
+    @bot.callback_query_handler(func=lambda call: call.data == "asmm:delete_orders")
     def delete_orders(call: types.CallbackQuery):
         if os.path.exists(ORDERS_PATH):
             os.remove(ORDERS_PATH)
@@ -3576,7 +3806,7 @@ def init_commands(c_: Cardinal):
         bot.edit_message_text("Файлы заказов удалены.", call.message.chat.id, call.message.message_id)
         files_menu(call)
 
-    @bot.callback_query_handler(func=lambda call: call.data == "toggle_auto_refunds")
+    @bot.callback_query_handler(func=lambda call: call.data == "asmm:toggle_auto_refunds")
     def toggle_auto_refunds(call: types.CallbackQuery):
         cfg = load_config()
         ar_ = cfg.get("auto_refunds", True)
@@ -3585,7 +3815,7 @@ def init_commands(c_: Cardinal):
         bot.answer_callback_query(call.id, f"✅ Автовозвраты: {'ВКЛ' if cfg['auto_refunds'] else 'ВЫКЛ'}")
         misc_settings(call)
 
-    @bot.callback_query_handler(func=lambda call: call.data == "toggle_confirm_link")
+    @bot.callback_query_handler(func=lambda call: call.data == "asmm:toggle_confirm_link")
     def toggle_confirm_link(call: types.CallbackQuery):
         cfg = load_config()
         confirm_link = cfg.get("confirm_link", True)
@@ -3594,7 +3824,7 @@ def init_commands(c_: Cardinal):
         bot.answer_callback_query(call.id, f"✅ Подтверждение ссылки: {'ВКЛ' if cfg['confirm_link'] else 'ВЫКЛ'}")
         misc_settings(call)
 
-    @bot.callback_query_handler(func=lambda call: call.data == "toggle_send_auto_lots")
+    @bot.callback_query_handler(func=lambda call: call.data == "asmm:toggle_send_auto_lots")
     def toggle_send_auto_lots(call: types.CallbackQuery):
         cfg = load_config()
         current_value = cfg.get("send_auto_lots", True)
@@ -3603,7 +3833,7 @@ def init_commands(c_: Cardinal):
         bot.answer_callback_query(call.id, f"Отправка auto_lots.json {'отключена' if current_value else 'включена'}!")
         misc_settings(call)
         
-    @bot.callback_query_handler(func=lambda call: call.data == "toggle_auto_start")
+    @bot.callback_query_handler(func=lambda call: call.data == "asmm:toggle_auto_start")
     def toggle_auto_start(call: types.CallbackQuery):
         cfg = load_config()
         current_value = cfg.get("auto_start", False)
@@ -3612,19 +3842,19 @@ def init_commands(c_: Cardinal):
         bot.answer_callback_query(call.id, f"Автозапуск плагина {'отключен' if current_value else 'включен'}!")
         misc_settings(call)
 
-    @bot.callback_query_handler(func=lambda call: call.data == "change_send_interval")
+    @bot.callback_query_handler(func=lambda call: call.data == "asmm:change_send_interval")
     def change_send_interval(call: types.CallbackQuery):
         cfg = load_config()
         current_interval = cfg.get("send_auto_lots_interval", 30)
         
         kb_ = InlineKeyboardMarkup()
-        kb_.add(InlineKeyboardButton("🔙 Вернуться назад", callback_data="cancel_interval_change"))
+        kb_.add(InlineKeyboardButton("🔙 Вернуться назад", callback_data="asmm:cancel_interval_change"))
         
         msg_ = bot.edit_message_text(f"Текущий интервал отправки: {current_interval} минут\n\nВведите новый интервал отправки auto_lots.json в минутах (от 5 до 1440):", 
                                 call.message.chat.id, call.message.message_id, reply_markup=kb_)
         bot.register_next_step_handler(msg_, process_send_interval_change)
 
-    @bot.callback_query_handler(func=lambda call: call.data == "cancel_interval_change")
+    @bot.callback_query_handler(func=lambda call: call.data == "asmm:cancel_interval_change")
     def cancel_interval_change(call: types.CallbackQuery):
         bot.clear_step_handler_by_chat_id(call.message.chat.id)
         misc_settings(call)
@@ -3644,12 +3874,12 @@ def init_commands(c_: Cardinal):
             save_config(cfg)
             
             kb_ = InlineKeyboardMarkup()
-            kb_.add(InlineKeyboardButton("🔙 К настройкам", callback_data="misc_settings"))
+            kb_.add(InlineKeyboardButton("🔙 К настройкам", callback_data="asmm:misc_settings"))
             bot.send_message(message.chat.id, f"✅ Интервал отправки auto_lots.json установлен: {new_interval} минут", reply_markup=kb_)
         except ValueError:
             bot.send_message(message.chat.id, "❌ Ошибка: Введите корректное число минут.")
             
-    @bot.callback_query_handler(func=lambda call: call.data == "return_to_settings")
+    @bot.callback_query_handler(func=lambda call: call.data == "asmm:return_to_settings")
     def return_to_settings(call: types.CallbackQuery):
         
         cfg = load_config()
@@ -3687,99 +3917,99 @@ def init_commands(c_: Cardinal):
         kb = InlineKeyboardMarkup(row_width=2)
         
         kb.add(
-            InlineKeyboardButton("🛍️ Каталог лотов", callback_data="lot_settings"),
-            InlineKeyboardButton("➕ Создать новый лот", callback_data="add_new_lot")
+            InlineKeyboardButton("🛍️ Каталог лотов", callback_data="asmm:lot_settings"),
+            InlineKeyboardButton("➕ Создать новый лот", callback_data="asmm:add_new_lot")
         )
         
         kb.add(
-            InlineKeyboardButton("🔌 Интеграция API", callback_data="api_settings"),
+            InlineKeyboardButton("🔌 Интеграция API", callback_data="asmm:api_settings"),
         )
         
         kb.add(
-            InlineKeyboardButton("🌐 Доверенные сайты", callback_data="manage_websites"),
-            InlineKeyboardButton("💬 Шаблоны сообщений", callback_data="edit_messages")
+            InlineKeyboardButton("🌐 Доверенные сайты", callback_data="asmm:manage_websites"),
+            InlineKeyboardButton("💬 Шаблоны сообщений", callback_data="asmm:edit_messages")
         )
         
         kb.add(
-            InlineKeyboardButton("📊 Бэкап и аналитика", callback_data="files_menu"),
-            InlineKeyboardButton("⚙️ Тонкая настройка", callback_data="misc_settings")
+            InlineKeyboardButton("📊 Бэкап и аналитика", callback_data="asmm:files_menu"),
+            InlineKeyboardButton("⚙️ Тонкая настройка", callback_data="asmm:misc_settings")
         )
         
         kb.add(
-            InlineKeyboardButton("📚 Полезные ресурсы", callback_data="links_menu")
+            InlineKeyboardButton("📚 Полезные ресурсы", callback_data="asmm:links_menu")
         )
 
         bot.edit_message_text(txt_, call.message.chat.id, call.message.message_id, parse_mode='HTML', reply_markup=kb)
 
-    @bot.callback_query_handler(func=lambda call: call.data == "return_to_lots")
+    @bot.callback_query_handler(func=lambda call: call.data == "asmm:return_to_lots")
     def return_to_lots(call: types.CallbackQuery):
         page = _save_lot_page(call.message.chat.id, _get_lot_page(call.message.chat.id))
         bot.edit_message_text("Выберите лот:", call.message.chat.id, call.message.message_id, reply_markup=generate_lots_keyboard(page))
 
-    @bot.callback_query_handler(func=lambda call: call.data.startswith("change_name_"))
+    @bot.callback_query_handler(func=lambda call: call.data.startswith("asmm:change_name:"))
     def change_name(call: types.CallbackQuery):
-        lot_key = call.data.split("_", 2)[2]
+        lot_key = call.data.split(":", 2)[-1]
         msg_ = bot.edit_message_text(f"Введите новое название для {lot_key}:", call.message.chat.id, call.message.message_id)
         bot.register_next_step_handler(msg_, process_name_change, lot_key)
 
-    @bot.callback_query_handler(func=lambda call: call.data.startswith("change_id_"))
+    @bot.callback_query_handler(func=lambda call: call.data.startswith("asmm:change_id:"))
     def change_id(call: types.CallbackQuery):
-        lot_key = call.data.split("_", 2)[2]
+        lot_key = call.data.split(":", 2)[-1]
         msg_ = bot.edit_message_text(f"Введите новый ID услуги для {lot_key}:", call.message.chat.id, call.message.message_id)
         bot.register_next_step_handler(msg_, process_id_change, lot_key)
 
-    @bot.callback_query_handler(func=lambda call: call.data.startswith("change_quantity_"))
+    @bot.callback_query_handler(func=lambda call: call.data.startswith("asmm:change_quantity:"))
     def change_quantity(call: types.CallbackQuery):
-        lot_key = call.data.split("_", 2)[2]
+        lot_key = call.data.split(":", 2)[-1]
         msg_ = bot.edit_message_text(f"Введите новое количество для {lot_key}:", call.message.chat.id, call.message.message_id)
         bot.register_next_step_handler(msg_, process_quantity_change, lot_key)
 
-    @bot.callback_query_handler(func=lambda call: call.data.startswith("change_snum_"))
+    @bot.callback_query_handler(func=lambda call: call.data.startswith("asmm:change_snum:"))
     def change_snum(call: types.CallbackQuery):
-        lot_key = call.data.split("_", 2)[2]
+        lot_key = call.data.split(":", 2)[-1]
         msg_ = bot.edit_message_text(f"Введите номер сервиса для {lot_key}:", call.message.chat.id, call.message.message_id)
         bot.register_next_step_handler(msg_, process_service_num_change, lot_key)
 
-    @bot.callback_query_handler(func=lambda call: call.data.startswith("delete_one_lot_"))
+    @bot.callback_query_handler(func=lambda call: call.data.startswith("asmm:delete_one_lot:"))
     def delete_one_lot_callback(call: types.CallbackQuery):
-        lot_key = call.data.split("_", 3)[3]
+        lot_key = call.data.split(":", 2)[-1]
         delete_one_lot(call, lot_key)
 
-    @bot.callback_query_handler(func=lambda call: call.data == "api_settings")
+    @bot.callback_query_handler(func=lambda call: call.data == "asmm:api_settings")
     def api_settings_callback(call: types.CallbackQuery):
         api_settings_menu(call)
 
-    @bot.callback_query_handler(func=lambda call: call.data.startswith("edit_apiurl_"))
+    @bot.callback_query_handler(func=lambda call: call.data.startswith("asmm:edit_apiurl:"))
     def edit_apiurl(call: types.CallbackQuery):
-        idx_ = int(call.data.split("_")[-1])
+        idx_ = int(call.data.split(":")[-1])
         msg_ = bot.edit_message_text(f"Введите новый URL для сервиса #{idx_}:", call.message.chat.id, call.message.message_id)
         bot.register_next_step_handler(msg_, process_apiurl_change, idx_)
 
-    @bot.callback_query_handler(func=lambda call: call.data.startswith("edit_apikey_"))
+    @bot.callback_query_handler(func=lambda call: call.data.startswith("asmm:edit_apikey:"))
     def edit_apikey(call: types.CallbackQuery):
-        idx_ = int(call.data.split("_")[-1])
+        idx_ = int(call.data.split(":")[-1])
         msg_ = bot.edit_message_text(f"Введите новый ключ для сервиса #{idx_}:", call.message.chat.id, call.message.message_id)
         bot.register_next_step_handler(msg_, process_apikey_change, idx_)
 
-    @bot.callback_query_handler(func=lambda call: call.data.startswith("check_balance_"))
+    @bot.callback_query_handler(func=lambda call: call.data.startswith("asmm:check_balance:"))
     def check_balance(call: types.CallbackQuery):
-        idx_ = int(call.data.split("_")[-1])
+        idx_ = int(call.data.split(":")[-1])
         check_balance_func(call, idx_)
 
-    @bot.callback_query_handler(func=lambda call: call.data == "add_new_lot")
+    @bot.callback_query_handler(func=lambda call: call.data == "asmm:add_new_lot")
     def add_new_lot(call: types.CallbackQuery):
         bot.delete_message(call.message.chat.id, call.message.message_id)
         msg_ = bot.send_message(call.message.chat.id, "Введите ID лота для добавления:")
         bot.register_next_step_handler(msg_, process_new_lot_id_step)
 
-    @bot.callback_query_handler(func=lambda call: call.data == "update_lot_ids")
+    @bot.callback_query_handler(func=lambda call: call.data == "asmm:update_lot_ids")
     def update_lot_ids(call: types.CallbackQuery):
         cfg = load_config()
         reindex_lots(cfg)
         bot.answer_callback_query(call.id, "Номера лотов обновлены.")
         misc_settings(call)
 
-    @bot.callback_query_handler(func=lambda call: call.data == "edit_messages")
+    @bot.callback_query_handler(func=lambda call: call.data == "asmm:edit_messages")
     def edit_messages_menu(call: types.CallbackQuery):
         cfg = load_config()
         msg_payment = html.escape(cfg["messages"]["after_payment"])
@@ -3803,19 +4033,19 @@ def init_commands(c_: Cardinal):
 
         kb = InlineKeyboardMarkup(row_width=1)
         kb.add(
-            InlineKeyboardButton("Изменить текст после оплаты", callback_data="edit_msg_payment"),
-            InlineKeyboardButton("Изменить текст после подтверждения", callback_data="edit_msg_confirmation")
+            InlineKeyboardButton("Изменить текст после оплаты", callback_data="asmm:edit_msg_payment"),
+            InlineKeyboardButton("Изменить текст после подтверждения", callback_data="asmm:edit_msg_confirmation")
         )
-        kb.add(InlineKeyboardButton("🔙 Назад", callback_data="return_to_settings"))
+        kb.add(InlineKeyboardButton("🔙 Назад", callback_data="asmm:return_to_settings"))
 
         bot.edit_message_text(text_, call.message.chat.id, call.message.message_id, parse_mode="HTML", reply_markup=kb)
 
-    @bot.callback_query_handler(func=lambda call: call.data == "edit_msg_payment")
+    @bot.callback_query_handler(func=lambda call: call.data == "asmm:edit_msg_payment")
     def edit_msg_payment(call: types.CallbackQuery):
         msg_ = bot.edit_message_text("Введите новый текст после оплаты:", call.message.chat.id, call.message.message_id)
         bot.register_next_step_handler(msg_, process_message_payment_change)
 
-    @bot.callback_query_handler(func=lambda call: call.data == "edit_msg_confirmation")
+    @bot.callback_query_handler(func=lambda call: call.data == "asmm:edit_msg_confirmation")
     def edit_msg_confirmation(call: types.CallbackQuery):
         msg_ = bot.edit_message_text("Введите новый текст после подтверждения:", call.message.chat.id, call.message.message_id)
         bot.register_next_step_handler(msg_, process_message_confirmation_change)
@@ -3826,7 +4056,7 @@ def init_commands(c_: Cardinal):
         cfg["messages"]["after_payment"] = new_text
         save_config(cfg)
         kb = InlineKeyboardMarkup()
-        kb.add(InlineKeyboardButton("🔙 Назад", callback_data="return_to_settings"))
+        kb.add(InlineKeyboardButton("🔙 Назад", callback_data="asmm:return_to_settings"))
         bot.send_message(message.chat.id, "Текст после оплаты обновлен.", reply_markup=kb)
 
     def process_message_confirmation_change(message: types.Message):
@@ -3835,15 +4065,15 @@ def init_commands(c_: Cardinal):
         cfg["messages"]["after_confirmation"] = new_text
         save_config(cfg)
         kb = InlineKeyboardMarkup()
-        kb.add(InlineKeyboardButton("🔙 Назад", callback_data="return_to_settings"))
+        kb.add(InlineKeyboardButton("🔙 Назад", callback_data="asmm:return_to_settings"))
         bot.send_message(message.chat.id, "Текст после подтверждения обновлен.", reply_markup=kb)
 
-    @bot.callback_query_handler(func=lambda call: call.data == "add_service")
+    @bot.callback_query_handler(func=lambda call: call.data == "asmm:add_service")
     def add_service(call: types.CallbackQuery):
         msg_ = bot.edit_message_text("Введите номер нового сервиса (число):", call.message.chat.id, call.message.message_id)
         bot.register_next_step_handler(msg_, process_add_service)
 
-    @bot.callback_query_handler(func=lambda call: call.data == "delete_service")
+    @bot.callback_query_handler(func=lambda call: call.data == "asmm:delete_service")
     def delete_service(call: types.CallbackQuery):
         msg_ = bot.edit_message_text("Введите номер сервиса для удаления:", call.message.chat.id, call.message.message_id)
         bot.register_next_step_handler(msg_, process_delete_service)
@@ -3868,7 +4098,7 @@ def init_commands(c_: Cardinal):
         }
         save_config(cfg)
         kb_ = InlineKeyboardMarkup()
-        kb_.add(InlineKeyboardButton("🔙 К настройкам API", callback_data="api_settings"))
+        kb_.add(InlineKeyboardButton("🔙 К настройкам API", callback_data="asmm:api_settings"))
         bot.send_message(message.chat.id, f"✅ Сервис #{srv_num} добавлен. Настройте его URL и ключ.", reply_markup=kb_)
 
     def process_delete_service(message: types.Message):
@@ -3886,10 +4116,10 @@ def init_commands(c_: Cardinal):
         del cfg["services"][str(srv_num)]
         save_config(cfg)
         kb_ = InlineKeyboardMarkup()
-        kb_.add(InlineKeyboardButton("🔙 К настройкам API", callback_data="api_settings"))
+        kb_.add(InlineKeyboardButton("🔙 К настройкам API", callback_data="asmm:api_settings"))
         bot.send_message(message.chat.id, f"✅ Сервис #{srv_num} удален.", reply_markup=kb_)
 
-    @bot.callback_query_handler(func=lambda call: call.data == "set_notification_chat_id")
+    @bot.callback_query_handler(func=lambda call: call.data == "asmm:set_notification_chat_id")
     def set_notification_chat_id(call: types.CallbackQuery):
         msg_ = bot.edit_message_text(f"Введите Chat ID для уведомлений (например, -1001234567890 для группы или ваш ID, ваш id: {call.message.chat.id}):", 
                                     call.message.chat.id, call.message.message_id)
@@ -3902,38 +4132,38 @@ def init_commands(c_: Cardinal):
             cfg["notification_chat_id"] = new_chat_id
             save_config(cfg)
             kb_ = InlineKeyboardMarkup()
-            kb_.add(InlineKeyboardButton("🔙 К настройкам", callback_data="return_to_settings"))
+            kb_.add(InlineKeyboardButton("🔙 К настройкам", callback_data="asmm:return_to_settings"))
             bot.send_message(message.chat.id, f"✅ Chat ID для уведомлений установлен: {new_chat_id}", reply_markup=kb_)
         except ValueError:
             bot.send_message(message.chat.id, "❌ Ошибка: Введите корректный Chat ID (целое число).")
 
-    @bot.callback_query_handler(func=lambda call: call.data == "files_menu")
+    @bot.callback_query_handler(func=lambda call: call.data == "asmm:files_menu")
     def files_menu_callback(call: types.CallbackQuery):
         files_menu(call)
 
-    @bot.callback_query_handler(func=lambda call: call.data == "misc_settings")
+    @bot.callback_query_handler(func=lambda call: call.data == "asmm:misc_settings")
     def misc_settings_callback(call: types.CallbackQuery):
         misc_settings(call)
 
-    @bot.callback_query_handler(func=lambda call: call.data == "links_menu")
+    @bot.callback_query_handler(func=lambda call: call.data == "asmm:links_menu")
     def links_menu_callback(call: types.CallbackQuery):
         links_menu(call)
 
     # v11.3: бывшие inline-заголовки теперь полноценные кнопки.
-    @bot.callback_query_handler(func=lambda call: call.data == "show_all_api_urls")
+    @bot.callback_query_handler(func=lambda call: call.data == "asmm:show_all_api_urls")
     def show_all_api_urls_callback(call: types.CallbackQuery):
         show_all_api_urls_func(call)
 
-    @bot.callback_query_handler(func=lambda call: call.data == "show_all_api_keys")
+    @bot.callback_query_handler(func=lambda call: call.data == "asmm:show_all_api_keys")
     def show_all_api_keys_callback(call: types.CallbackQuery):
         show_all_api_keys_func(call)
 
-    @bot.callback_query_handler(func=lambda call: call.data == "check_all_balances")
+    @bot.callback_query_handler(func=lambda call: call.data == "asmm:check_all_balances")
     def check_all_balances_callback(call: types.CallbackQuery):
         check_all_balances_func(call)
 
     # v11.2: бекомпат для старых сообщений с заголовками — тихо проглатываем.
-    @bot.callback_query_handler(func=lambda call: call.data == "header_no_action")
+    @bot.callback_query_handler(func=lambda call: call.data == "asmm:header_no_action")
     def header_no_action_callback(call: types.CallbackQuery):
         try:
             bot.answer_callback_query(call.id)
@@ -5129,7 +5359,10 @@ def on_plugin_unload(*_args, **_kwargs):
 BIND_TO_PRE_INIT = [init_commands]
 BIND_TO_NEW_MESSAGE = [auto_smm_handler]
 BIND_TO_NEW_ORDER = [auto_smm_handler]
-BIND_TO_DELETE = [on_plugin_unload]
+# review-fix: FPC ожидает callable (см. cardinal.py / plugins_cp.py:159).
+# Раньше было `[on_plugin_unload]` → при удалении плагина: TypeError: list is not callable
+# и graceful shutdown не запускался.
+BIND_TO_DELETE = on_plugin_unload
 
 def start_order_checking_if_needed(c: Cardinal):
     if RUNNING:  
